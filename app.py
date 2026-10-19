@@ -1,12 +1,11 @@
-from flask import Flask, request, jsonify
+from http.server import HTTPServer, BaseHTTPRequestHandler
+import json
 import sqlite3
 import os
 
-app = Flask(__name__)
 DB_FILE = 'licenses.db'
 
 def init_db():
-    """Создает базу данных и список наших 15 ключей, если их еще нет"""
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     cursor.execute('''
@@ -18,7 +17,6 @@ def init_db():
         )
     ''')
     
-    # Наши 15 уникальных ключей
     valid_keys = [
         "SUGAR-7771-AAAA", "SUGAR-7772-BBBB", "SUGAR-7773-CCCC", 
         "SUGAR-7774-DDDD", "SUGAR-7775-EEEE", "SUGAR-7776-FFFF", 
@@ -35,46 +33,73 @@ def init_db():
 
 init_db()
 
-@app.route('/activate', methods=['POST'])
-def activate():
-    data = request.json
-    key = data.get('key', '').strip()
-    hwid = data.get('hwid', '').strip()
+class SimpleHandler(BaseHTTPRequestHandler):
+    def do_POST(self):
+        if self.path == '/activate':
+            content_length = int(self.headers.get('Content-Length', 0))
+            post_data = self.rfile.read(content_length)
+            
+            try:
+                data = json.loads(post_data.decode('utf-8'))
+                key = data.get('key', '').strip()
+                hwid = data.get('hwid', '').strip()
+            except:
+                self.send_response(400)
+                self.end_headers()
+                self.wfile.write(json.dumps({"status": "error", "message": "Invalid JSON"}).encode('utf-8'))
+                return
 
-    if not key or not hwid:
-        return jsonify({"status": "error", "message": "Missing key or hwid"}), 400
+            if not key or not hwid:
+                self.send_response(400)
+                self.end_headers()
+                self.wfile.write(json.dumps({"status": "error", "message": "Missing key or hwid"}).encode('utf-8'))
+                return
 
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
+            conn = sqlite3.connect(DB_FILE)
+            cursor = conn.cursor()
+            cursor.execute('SELECT hwid, is_used FROM keys WHERE key_value = ?', (key,))
+            row = cursor.fetchone()
 
-    # Проверяем, существует ли вообще такой ключ
-    cursor.execute('SELECT hwid, is_used FROM keys WHERE key_value = ?', (key,))
-    row = cursor.fetchone()
+            if not row:
+                conn.close()
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(json.dumps({"status": "error", "message": "Неверный ключ активации!"}).encode('utf-8'))
+                return
 
-    if not row:
-        conn.close()
-        return jsonify({"status": "error", "message": "Неверный ключ активации!"})
+            db_hwid, is_used = row
 
-    db_hwid, is_used = row
+            if is_used == 1:
+                if db_hwid == hwid:
+                    conn.close()
+                    self.send_response(200)
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"status": "success", "message": "Активировано повторно"}).encode('utf-8'))
+                    return
+                else:
+                    conn.close()
+                    self.send_response(200)
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"status": "error", "message": "Этот ключ уже активирован на другом устройстве!"}).encode('utf-8'))
+                    return
 
-    # Если ключ уже использован
-    if is_used == 1:
-        if db_hwid == hwid:
-            # Если тот же самый ПК пробует войти повторно — разрешаем
+            cursor.execute('UPDATE keys SET hwid = ?, is_used = 1 WHERE key_value = ?', (hwid, key))
+            conn.commit()
             conn.close()
-            return jsonify({"status": "success", "message": "Активировано повторно"})
+
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(json.dumps({"status": "success", "message": "Успешная активация!"}).encode('utf-8'))
         else:
-            # Если чужой ПК пытается ввести этот же ключ
-            conn.close()
-            return jsonify({"status": "error", "message": "Этот ключ уже активирован на другом устройстве!"})
+            self.send_response(404)
+            self.end_headers()
 
-    # Если ключ свободен, привязываем его к текущему HWID
-    cursor.execute('UPDATE keys SET hwid = ?, is_used = 1 WHERE key_value = ?', (hwid, key))
-    conn.commit()
-    conn.close()
-
-    return jsonify({"status": "success", "message": "Успешная активация!"})
+def run():
+    port = int(os.environ.get('PORT', 5000))
+    server_address = ('0.0.0.0', port)
+    httpd = HTTPServer(server_address, SimpleHandler)
+    print(f'Server running on port {port}...')
+    httpd.serve_forever()
 
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port)
+    run()
