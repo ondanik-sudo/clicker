@@ -7,9 +7,14 @@
 #   ADMIN_IDS       числовые Telegram ID админов через запятую (узнать: команда /id в боте)
 #   ADMIN_USERNAMES ники админов через запятую, без @ (по умолчанию danilsugar)
 #   RENDER_EXTERNAL_URL  Render задаёт сам; по нему бот ставит webhook
+#   PAY_CARD        номер карты для оплаты переводом (временно, до ЮKassa)
+#   PAY_NAME        получатель, как он виден при переводе (например «Данил С.»)
+#   PAY_BANK        банк карты (необязательно)
+#   SUPPORT_USERNAME  ник для кнопки «Поддержка», без @ (по умолчанию danilsugar)
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 import base64
 import hashlib
+import html
 import json
 import os
 import secrets
@@ -28,6 +33,13 @@ ADMIN_IDS = {int(x) for x in os.environ.get('ADMIN_IDS', '').replace(' ', '').sp
 ADMIN_USERNAMES = {x.strip().lstrip('@').lower() for x in os.environ.get('ADMIN_USERNAMES', 'danilsugar').split(',') if x.strip()}
 TG_SECRET = hashlib.sha256(('sugarclick-webhook:' + TG_TOKEN).encode()).hexdigest()[:48]
 CLIENT_VERSION = 2  # клиенты старше этой версии не могут активировать ключи (они не проверяют срок)
+PAY_CARD = os.environ.get('PAY_CARD', '').strip()
+PAY_NAME = os.environ.get('PAY_NAME', '').strip()
+PAY_BANK = os.environ.get('PAY_BANK', '').strip()
+SUPPORT_USERNAME = os.environ.get('SUPPORT_USERNAME', 'danilsugar').strip().lstrip('@')
+
+# цены в рублях для продажи через бота
+PRICES = {'day': 50, '3days': 100, 'week': 300, 'month': 550}
 
 # тариф: (часы, название для пользователя)
 PLANS = {
@@ -93,6 +105,24 @@ def init_db():
             banned INTEGER DEFAULT 0,
             last_seen BIGINT
         )''')
+        # заказы из бота: new (показаны реквизиты) -> proof (ждём чек) -> review (чек у админов) -> paid / rejected / cancelled
+        serial = 'SERIAL PRIMARY KEY' if DATABASE_URL else 'INTEGER PRIMARY KEY AUTOINCREMENT'
+        q(conn, f'''CREATE TABLE IF NOT EXISTS orders (
+            id {serial},
+            user_id BIGINT NOT NULL,
+            username TEXT,
+            first_name TEXT,
+            plan TEXT NOT NULL,
+            amount INTEGER NOT NULL,
+            status TEXT NOT NULL,
+            created_at BIGINT NOT NULL,
+            paid_at BIGINT,
+            key TEXT,
+            admin_msgs TEXT,
+            decided_by TEXT
+        )''')
+        # чаты админов, которым слать чеки (ADMIN_USERNAMES не дают chat_id, пока админ сам не напишет боту)
+        q(conn, 'CREATE TABLE IF NOT EXISTS bot_admins (uid BIGINT PRIMARY KEY)')
 
 
 def get_device(conn, hwid):
@@ -124,6 +154,16 @@ def extend_device(conn, hwid, hours, plan_name, now, trial=False):
 
 def new_key():
     return 'SC-' + '-'.join(''.join(secrets.choice(KEY_ALPHABET) for _ in range(4)) for _ in range(3))
+
+
+def make_keys(conn, plan, n, now):
+    keys = []
+    while len(keys) < n:
+        k = new_key()
+        if not q(conn, 'SELECT 1 FROM sub_keys WHERE key = ?', (k,)).fetchone():
+            q(conn, 'INSERT INTO sub_keys (key, plan, created_at) VALUES (?, ?, ?)', (k, plan, now))
+            keys.append(k)
+    return keys
 
 
 def normalize_key(k):
@@ -188,6 +228,12 @@ def api_trial(data):
             return {'status': 'error', 'message': 'Компьютер заблокирован'}
         if dev and dev['trial_at']:
             return {'status': 'error', 'message': 'Пробный час уже использован'}
+        # атомарно занимаем пробный час: при пачке одновременных запросов проверка выше пропускала несколько,
+        # и каждый добавлял по часу. UPDATE ... WHERE trial_at IS NULL пройдёт ровно у одного (rowcount = 1)
+        q(conn, 'INSERT INTO devices (hwid, expires_at, plan, last_seen) VALUES (?, 0, NULL, ?) ON CONFLICT (hwid) DO NOTHING', (hwid, now))
+        cur = q(conn, 'UPDATE devices SET trial_at = ? WHERE hwid = ? AND trial_at IS NULL', (now, hwid))
+        if cur.rowcount != 1:
+            return {'status': 'error', 'message': 'Пробный час уже использован'}
         extend_device(conn, hwid, PLANS['hour'][0], PLANS['hour'][1], now, trial=True)
         dev = get_device(conn, hwid)
     return dict(status='success', message='Пробный час активирован', **license_payload(hwid, now, dev))
@@ -244,7 +290,9 @@ BOT_HELP = (
     '/info &lt;ключ&gt; — статус ключа и подписки\n'
     '/ban &lt;ключ&gt; — заблокировать ключ и компьютер\n'
     '/unban &lt;ключ&gt; — разблокировать\n'
-    '/stats — статистика\n'
+    '/stats — статистика и выручка\n'
+    '/orders — заказы, ждущие проверки\n'
+    '/shop — меню покупателя (как его видят клиенты)\n'
     '/id — ваш Telegram ID'
 )
 
@@ -263,13 +311,8 @@ def bot_command(text, now):
             return 'Неизвестный тариф. Доступны: day, 3days, week, month'
         n = int(args[1]) if len(args) > 1 and args[1].isdigit() else 1
         n = max(1, min(n, 50))
-        keys = []
         with db() as conn:
-            while len(keys) < n:
-                k = new_key()
-                if not q(conn, 'SELECT 1 FROM sub_keys WHERE key = ?', (k,)).fetchone():
-                    q(conn, 'INSERT INTO sub_keys (key, plan, created_at) VALUES (?, ?, ?)', (k, plan, now))
-                    keys.append(k)
+            keys = make_keys(conn, plan, n, now)
         return f'<b>{PLANS[plan][1]}</b> × {n}\n\n' + '\n'.join(f'<code>{k}</code>' for k in keys)
     if cmd in ('/info', '/ban', '/unban'):
         if not args:
@@ -305,39 +348,287 @@ def bot_command(text, now):
             active = q(conn, 'SELECT COUNT(*) FROM devices WHERE expires_at > ? AND banned = 0', (now,)).fetchone()[0]
             trials = q(conn, 'SELECT COUNT(*) FROM devices WHERE trial_at IS NOT NULL').fetchone()[0]
             by_plan = q(conn, 'SELECT plan, COUNT(*), SUM(CASE WHEN hwid IS NULL THEN 0 ELSE 1 END) FROM sub_keys GROUP BY plan').fetchall()
+            sold, revenue = q(conn, "SELECT COUNT(*), COALESCE(SUM(amount), 0) FROM orders WHERE status = 'paid'").fetchone()
+            month_rev = q(conn, "SELECT COALESCE(SUM(amount), 0) FROM orders WHERE status = 'paid' AND paid_at > ?", (now - 30 * 86400,)).fetchone()[0]
+            waiting = q(conn, "SELECT COUNT(*) FROM orders WHERE status = 'review'").fetchone()[0]
         lines = ['<b>Статистика</b>', 'База: ' + ('PostgreSQL' if DATABASE_URL else '⚠️ SQLite (временная, стирается при перезапуске!)'),
-                 f'Ключей: {total}, активировано: {used}', f'Активных подписок: {active}', f'Пробных часов: {trials}', '']
+                 f'Ключей: {total}, активировано: {used}', f'Активных подписок: {active}', f'Пробных часов: {trials}', '',
+                 f'Продано через бота: {sold} на {revenue} ₽', f'За 30 дней: {month_rev} ₽', f'Ждут проверки: {waiting}', '']
         for plan, cnt, u in by_plan:
             lines.append(f'{PLANS.get(plan, (0, plan))[1]}: {u or 0} из {cnt}')
         return '\n'.join(lines)
+    if cmd == '/orders':
+        with db() as conn:
+            rows = q(conn, "SELECT id, plan, amount, username, user_id, created_at FROM orders WHERE status = 'review' ORDER BY id").fetchall()
+        if not rows:
+            return 'Заказов на проверке нет'
+        return '<b>Ждут проверки</b>\n\n' + '\n'.join(
+            f'#{oid} · {PLANS[plan][1]} · {amount} ₽ · {buyer_label(uname, uid)} · {fmt_time(ts)}' for oid, plan, amount, uname, uid, ts in rows)
     return 'Неизвестная команда. /help — список команд'
 
 
+# ===== Магазин: оплата переводом на карту с ручным подтверждением (временно, до ЮKassa) =====
+def is_admin(user):
+    uname = (user.get('username') or '').lower()
+    return user.get('id') in ADMIN_IDS or bool(uname and uname in ADMIN_USERNAMES)
+
+
+def buyer_label(username, user_id):
+    return f'@{html.escape(username)}' if username else f'id {user_id}'
+
+
+def admin_chats():
+    with db() as conn:
+        seen = {r[0] for r in q(conn, 'SELECT uid FROM bot_admins').fetchall()}
+    return ADMIN_IDS | seen
+
+
+def send(chat_id, text, buttons=None):
+    params = dict(chat_id=chat_id, text=text, parse_mode='HTML', disable_web_page_preview=True)
+    if buttons:
+        params['reply_markup'] = {'inline_keyboard': buttons}
+    return tg('sendMessage', **params)
+
+
+def show(chat_id, message_id, text, buttons=None):
+    """Меняет экран в том же сообщении (кнопки меню), а если не вышло - присылает новое."""
+    if message_id:
+        params = dict(chat_id=chat_id, message_id=message_id, text=text, parse_mode='HTML', disable_web_page_preview=True,
+                      reply_markup={'inline_keyboard': buttons or []})
+        res = tg('editMessageText', **params)
+        if res and res.get('ok'):
+            return
+    send(chat_id, text, buttons)
+
+
+def menu_screen():
+    plans = list(PRICES)
+    rows = [[{'text': f'{PLANS[p][1]} · {PRICES[p]} ₽', 'callback_data': f'buy:{p}'} for p in plans[i:i + 2]]
+            for i in range(0, len(plans), 2)]
+    rows.append([{'text': '🧾 Мои покупки', 'callback_data': 'my'}, {'text': '💬 Поддержка', 'callback_data': 'support'}])
+    text = ('<b>SugarClick</b> — подписка на автокликер для «Номерка»\n\n'
+            'Выберите тариф. После оплаты бот пришлёт ключ <code>SC-XXXX-XXXX-XXXX</code>, '
+            'его нужно ввести в программе в окне активации.')
+    return text, rows
+
+
+def order_screen(oid, plan, amount):
+    lines = [f'<b>Заказ #{oid} · {PLANS[plan][1]}</b>', '', f'Переведите <b>{amount} ₽</b> на карту:',
+             f'<code>{html.escape(PAY_CARD)}</code>']
+    if PAY_NAME:
+        lines.append(f'Получатель: {html.escape(PAY_NAME)}')
+    if PAY_BANK:
+        lines.append(f'Банк: {html.escape(PAY_BANK)}')
+    lines += ['', f'Переведите ровно {amount} ₽ одним платежом. После перевода нажмите «Я оплатил» и пришлите скриншот чека.']
+    buttons = [[{'text': '✅ Я оплатил', 'callback_data': f'paid:{oid}'}],
+               [{'text': '← Отменить заказ', 'callback_data': f'cancel:{oid}'}]]
+    return '\n'.join(lines), buttons
+
+
+def proof_screen(oid):
+    text = (f'<b>Заказ #{oid}</b>\n\nПришлите сюда скриншот чека о переводе (картинкой или файлом). '
+            'Администратор проверит оплату, и ключ придёт в этот чат.')
+    return text, [[{'text': '← Отменить заказ', 'callback_data': f'cancel:{oid}'}]]
+
+
+def support_screen():
+    text = f'По вопросам оплаты и работы программы пишите @{html.escape(SUPPORT_USERNAME)}'
+    return text, [[{'text': '← Назад', 'callback_data': 'menu'}]]
+
+
+def purchases_screen(uid):
+    with db() as conn:
+        rows = q(conn, "SELECT id, plan, amount, status, paid_at, created_at, key FROM orders WHERE user_id = ? "
+                       "AND status IN ('paid', 'review') ORDER BY id DESC LIMIT 10", (uid,)).fetchall()
+    if not rows:
+        text = 'Покупок пока нет'
+    else:
+        items = []
+        for oid, plan, amount, status, paid_at, created_at, key in rows:
+            if status == 'paid':
+                items.append(f'#{oid} · {PLANS[plan][1]} · {amount} ₽ · {fmt_time(paid_at)}\n<code>{key}</code>')
+            else:
+                items.append(f'#{oid} · {PLANS[plan][1]} · {amount} ₽ · ⏳ на проверке')
+        text = '<b>Мои покупки</b>\n\n' + '\n\n'.join(items)
+    return text, [[{'text': '← Назад', 'callback_data': 'menu'}]]
+
+
+def notify_admins(text):
+    for cid in admin_chats():
+        send(cid, text)
+
+
+def update_admin_msgs(admin_msgs, caption):
+    for cid, mid in json.loads(admin_msgs or '[]'):
+        tg('editMessageCaption', chat_id=cid, message_id=mid, caption=caption, parse_mode='HTML')
+
+
+def review_caption(oid, plan, amount, username, user_id, first_name):
+    who = buyer_label(username, user_id)
+    if first_name:
+        who += f' ({html.escape(first_name)})'
+    return (f'💳 <b>Заказ #{oid}</b> · {PLANS[plan][1]} · <b>{amount} ₽</b>\n'
+            f'Покупатель: {who}, id <code>{user_id}</code>\n'
+            f'Проверьте, что перевод пришёл, и подтвердите.')
+
+
+def handle_proof(msg, user, chat_id):
+    """Покупатель прислал чек: отправляем его всем админам с кнопками подтверждения."""
+    uid = user.get('id')
+    with db() as conn:
+        row = q(conn, "SELECT id, plan, amount FROM orders WHERE user_id = ? AND status IN ('new', 'proof') ORDER BY id DESC LIMIT 1",
+                (uid,)).fetchone()
+        if not row:
+            return False
+        oid, plan, amount = row
+        q(conn, "UPDATE orders SET status = 'review' WHERE id = ?", (oid,))
+    caption = review_caption(oid, plan, amount, user.get('username'), uid, user.get('first_name'))
+    buttons = {'inline_keyboard': [[{'text': '✅ Подтвердить', 'callback_data': f'ok:{oid}'},
+                                    {'text': '❌ Отклонить', 'callback_data': f'no:{oid}'}]]}
+    sent = []
+    for cid in admin_chats():
+        if msg.get('photo'):
+            res = tg('sendPhoto', chat_id=cid, photo=msg['photo'][-1]['file_id'], caption=caption, parse_mode='HTML', reply_markup=buttons)
+        else:
+            res = tg('sendDocument', chat_id=cid, document=msg['document']['file_id'], caption=caption, parse_mode='HTML', reply_markup=buttons)
+        if res and res.get('ok'):
+            sent.append([cid, res['result']['message_id']])
+    with db() as conn:
+        q(conn, 'UPDATE orders SET admin_msgs = ? WHERE id = ?', (json.dumps(sent), oid))
+    if not sent:
+        print('Чек по заказу', oid, 'некому отправить: нет chat_id админов (ADMIN_IDS или /start от админа)')
+    send(chat_id, f'Чек по заказу #{oid} получен ✅\nОжидайте подтверждения — ключ придёт сюда же.')
+    return True
+
+
+def decide_order(oid, approve, admin_user):
+    """Админ подтвердил или отклонил оплату. Возвращает текст всплывающего ответа на кнопку."""
+    now = int(time.time())
+    admin_name = '@' + admin_user['username'] if admin_user.get('username') else str(admin_user.get('id'))
+    with db() as conn:
+        row = q(conn, 'SELECT plan, amount, user_id, username, first_name, status, admin_msgs, key, decided_by FROM orders WHERE id = ?',
+                (oid,)).fetchone()
+        if not row:
+            return 'Заказ не найден'
+        plan, amount, user_id, username, first_name, status, admin_msgs, key, decided_by = row
+        if status != 'review':
+            return f'Заказ уже обработан ({decided_by or status})'
+        # атомарно: если два админа нажали одновременно, пройдёт только один
+        new_status = 'paid' if approve else 'rejected'
+        cur = q(conn, "UPDATE orders SET status = ?, decided_by = ?, paid_at = ? WHERE id = ? AND status = 'review'",
+                (new_status, admin_name, now if approve else None, oid))
+        if cur.rowcount != 1:
+            return 'Заказ уже обработан'
+        if approve:
+            key = make_keys(conn, plan, 1, now)[0]
+            q(conn, 'UPDATE orders SET key = ? WHERE id = ?', (key, oid))
+    caption = review_caption(oid, plan, amount, username, user_id, first_name).rsplit('\n', 1)[0]
+    if approve:
+        send(user_id, f'✅ <b>Оплата подтверждена</b>\n\nЗаказ #{oid} · {PLANS[plan][1]}\nВаш ключ:\n<code>{key}</code>\n\n'
+                      'Откройте SugarClick и введите ключ в окне активации. Время подписки пойдёт с момента активации.',
+             [[{'text': '🧾 Мои покупки', 'callback_data': 'my'}]])
+        update_admin_msgs(admin_msgs, caption + f'\n\n✅ Подтвердил {html.escape(admin_name)}, ключ <code>{key}</code>')
+        return 'Ключ отправлен покупателю'
+    send(user_id, f'❌ Оплата по заказу #{oid} не подтверждена.\n\n'
+                  f'Если вы перевели деньги, напишите @{html.escape(SUPPORT_USERNAME)} и приложите чек.',
+         [[{'text': '← В меню', 'callback_data': 'menu'}]])
+    update_admin_msgs(admin_msgs, caption + f'\n\n❌ Отклонил {html.escape(admin_name)}')
+    return 'Заказ отклонён'
+
+
+def handle_callback(cb):
+    user = cb.get('from') or {}
+    uid = user.get('id')
+    msg = cb.get('message') or {}
+    chat_id = (msg.get('chat') or {}).get('id') or uid
+    mid = msg.get('message_id')
+    data = cb.get('data') or ''
+    action, _, arg = data.partition(':')
+    toast = None
+    if action in ('ok', 'no'):
+        toast = decide_order(int(arg), action == 'ok', user) if is_admin(user) else 'Только для админов'
+    elif action == 'menu':
+        show(chat_id, mid, *menu_screen())
+    elif action == 'my':
+        show(chat_id, mid, *purchases_screen(uid))
+    elif action == 'support':
+        show(chat_id, mid, *support_screen())
+    elif action == 'buy' and arg in PRICES:
+        if not PAY_CARD:
+            toast = 'Оплата временно недоступна, напишите в поддержку'
+        else:
+            now = int(time.time())
+            with db() as conn:
+                # у покупателя один открытый заказ: старые неоплаченные закрываем
+                q(conn, "UPDATE orders SET status = 'cancelled' WHERE user_id = ? AND status IN ('new', 'proof')", (uid,))
+                oid = q(conn, "INSERT INTO orders (user_id, username, first_name, plan, amount, status, created_at) "
+                              "VALUES (?, ?, ?, ?, ?, 'new', ?) RETURNING id",
+                        (uid, user.get('username'), user.get('first_name'), arg, PRICES[arg], now)).fetchone()[0]
+            show(chat_id, mid, *order_screen(oid, arg, PRICES[arg]))
+    elif action in ('paid', 'cancel'):
+        oid = int(arg)
+        new_status = 'proof' if action == 'paid' else 'cancelled'
+        with db() as conn:
+            cur = q(conn, "UPDATE orders SET status = ? WHERE id = ? AND user_id = ? AND status IN ('new', 'proof')",
+                    (new_status, oid, uid))
+            ok = cur.rowcount == 1
+        if not ok:
+            toast = 'Этот заказ уже закрыт'
+        elif action == 'paid':
+            show(chat_id, mid, *proof_screen(oid))
+        else:
+            show(chat_id, mid, *menu_screen())
+            toast = 'Заказ отменён'
+    params = {'callback_query_id': cb.get('id')}
+    if toast:
+        params['text'] = toast
+    tg('answerCallbackQuery', **params)
+
+
 def handle_update(update):
+    if update.get('callback_query'):
+        return handle_callback(update['callback_query'])
     msg = update.get('message') or {}
-    text = (msg.get('text') or '').strip()
+    chat = msg.get('chat') or {}
+    chat_id = chat.get('id')
     user = msg.get('from') or {}
-    chat_id = (msg.get('chat') or {}).get('id')
-    if not text.startswith('/') or chat_id is None:
+    if chat_id is None:
         return
-    uid, uname = user.get('id'), (user.get('username') or '').lower()
-    if text.split()[0].split('@')[0].lower() == '/id':
-        reply = f'Ваш Telegram ID: <code>{uid}</code>'
-    elif uid in ADMIN_IDS or (uname and uname in ADMIN_USERNAMES):
+    uid = user.get('id')
+    admin = is_admin(user)
+    if admin:
+        with db() as conn:
+            q(conn, 'INSERT INTO bot_admins (uid) VALUES (?) ON CONFLICT (uid) DO NOTHING', (uid,))
+    text = (msg.get('text') or '').strip()
+    cmd = text.split()[0].split('@')[0].lower() if text.startswith('/') else ''
+    if cmd == '/id':
+        return send(chat_id, f'Ваш Telegram ID: <code>{uid}</code>')
+    if chat.get('type') != 'private':
+        return
+    if msg.get('photo') or msg.get('document'):
+        if not handle_proof(msg, user, chat_id) and not admin:
+            send(chat_id, 'Сначала выберите тариф, затем пришлите чек.', menu_screen()[1])
+        return
+    if admin and cmd and cmd != '/shop':
         try:
             reply = bot_command(text, int(time.time()))
         except Exception as e:
-            reply = f'Ошибка: {e}'
-    else:
-        return  # чужим не отвечаем
-    tg('sendMessage', chat_id=chat_id, text=reply, parse_mode='HTML', disable_web_page_preview=True)
+            reply = f'Ошибка: {html.escape(str(e))}'
+        return send(chat_id, reply)
+    with db() as conn:
+        waiting = q(conn, "SELECT id FROM orders WHERE user_id = ? AND status = 'proof' ORDER BY id DESC LIMIT 1", (uid,)).fetchone()
+    if waiting and not cmd:
+        return send(chat_id, *proof_screen(waiting[0]))
+    if admin and not cmd:
+        return
+    send(chat_id, *menu_screen())
 
 
 def setup_webhook():
     base = os.environ.get('RENDER_EXTERNAL_URL', '').rstrip('/')
     if not (TG_TOKEN and base):
         return
-    res = tg('setWebhook', url=base + '/tg', secret_token=TG_SECRET, allowed_updates=['message'])
+    res = tg('setWebhook', url=base + '/tg', secret_token=TG_SECRET, allowed_updates=['message', 'callback_query'])
     print('setWebhook:', res)
 
 
