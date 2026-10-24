@@ -153,6 +153,16 @@ def init_db():
         )''')
         # ключи, выданные покупателю для себя (покупка или бонус за друга): по ним бот находит его подписку
         q(conn, 'CREATE TABLE IF NOT EXISTS user_keys (key TEXT PRIMARY KEY, uid BIGINT NOT NULL, kind TEXT)')
+        # уведомления из программы (выпала Tuatara): компьютер (hwid) -> чат в боте. code - одноразовый код из /start n<код>
+        q(conn, '''CREATE TABLE IF NOT EXISTS notify (
+            hwid TEXT PRIMARY KEY,
+            chat_id BIGINT,
+            name TEXT,
+            code TEXT,
+            code_at BIGINT,
+            win_at BIGINT DEFAULT 0,
+            win_n INTEGER DEFAULT 0
+        )''')
     # колонки, добавленные после первого запуска: в Postgres есть IF NOT EXISTS, в SQLite просто ловим ошибку дубля
     for col, decl in (('gift', 'INTEGER DEFAULT 0'), ('wish', 'TEXT'), ('promo', 'TEXT'), ('base_amount', 'INTEGER'),
                       ('discount', 'TEXT'), ('ref_key', 'TEXT')):
@@ -292,6 +302,75 @@ def api_check(data):
         if dev:
             q(conn, 'UPDATE devices SET last_seen = ? WHERE hwid = ?', (now, hwid))
     return dict(status='success', **license_payload(hwid, now, dev))
+
+
+# ===== Уведомления из программы =====
+NOTIFY_CODE_TTL = 900        # код из «Подключить» в программе действует 15 минут
+NOTIFY_PER_HOUR = 30         # больше сообщений в час с одного компьютера не шлём
+
+
+def api_notify_link(data):
+    hwid = data.get('hwid', '').strip()
+    if not hwid:
+        return dict(status='error', message='Нет HWID')
+    code, now = secrets.token_hex(6), int(time.time())
+    with db() as conn:
+        if not get_device(conn, hwid):
+            return dict(status='error', message='Сначала активируйте подписку')
+        q(conn, 'INSERT INTO notify (hwid, code, code_at) VALUES (?, ?, ?) '
+                'ON CONFLICT (hwid) DO UPDATE SET code = excluded.code, code_at = excluded.code_at', (hwid, code, now))
+    return dict(status='success', code=code, bot=bot_username())
+
+
+def api_notify_status(data):
+    with db() as conn:
+        row = q(conn, 'SELECT chat_id, name FROM notify WHERE hwid = ?', (data.get('hwid', '').strip(),)).fetchone()
+    return dict(status='success', linked=bool(row and row[0]), name=(row[1] if row and row[0] else '') or '')
+
+
+def api_notify_unlink(data):
+    with db() as conn:
+        q(conn, 'UPDATE notify SET chat_id = NULL, name = NULL WHERE hwid = ?', (data.get('hwid', '').strip(),))
+    return dict(status='success')
+
+
+def api_notify(data):
+    hwid, text, now = data.get('hwid', '').strip(), str(data.get('text') or '')[:1500], int(time.time())
+    if not hwid or not text:
+        return dict(status='error', message='Пустое сообщение')
+    with db() as conn:
+        row = q(conn, 'SELECT chat_id, win_at, win_n FROM notify WHERE hwid = ?', (hwid,)).fetchone()
+        if not row or not row[0]:
+            return dict(status='error', message='Уведомления не подключены', unlinked=True)
+        dev = get_device(conn, hwid)
+        if not dev or dev.get('banned') or (dev.get('expires_at') or 0) < now:
+            return dict(status='error', message='Подписка не активна')
+        chat_id, win_at, win_n = row
+        if now - (win_at or 0) >= 3600:
+            win_at, win_n = now, 0
+        if win_n >= NOTIFY_PER_HOUR:
+            return dict(status='error', message='Слишком много уведомлений за час')
+        q(conn, 'UPDATE notify SET win_at = ?, win_n = ? WHERE hwid = ?', (win_at, win_n + 1, hwid))
+    res = send(chat_id, text) or {}
+    if res.get('ok'):
+        return dict(status='success')
+    if res.get('error_code') == 403:         # пользователь заблокировал бота
+        api_notify_unlink(data)
+        return dict(status='error', message='Бот заблокирован в Telegram', unlinked=True)
+    return dict(status='error', message=res.get('description') or 'Telegram не ответил')
+
+
+def notify_bind(code, user, chat_id):
+    """/start n<код> из кнопки «Подключить» в программе."""
+    now = int(time.time())
+    name = '@' + user['username'] if user.get('username') else (user.get('first_name') or '')
+    with db() as conn:
+        row = q(conn, 'SELECT hwid, code_at FROM notify WHERE code = ?', (code,)).fetchone()
+        if not row or now - (row[1] or 0) > NOTIFY_CODE_TTL:
+            return send(chat_id, '⌛ Ссылка устарела. Нажмите «Подключить» в настройках SugarClick ещё раз.')
+        q(conn, 'UPDATE notify SET chat_id = ?, name = ?, code = NULL WHERE hwid = ?', (chat_id, name, row[0]))
+    send(chat_id, '🔔 <b>Уведомления SugarClick подключены</b>\n\nСюда придёт сообщение, когда на каком-нибудь аккаунте '
+                  'выпадет золотая Tuatara. Отключить можно в настройках программы.')
 
 
 # ===== Telegram-бот (webhook) =====
@@ -1008,6 +1087,8 @@ def handle_update(update):
         return send(chat_id, f'Ваш Telegram ID: <code>{uid}</code>')
     if chat.get('type') != 'private':
         return
+    if cmd == '/start' and len(parts) > 1 and parts[1].startswith('n') and len(parts[1]) > 6:
+        return notify_bind(parts[1][1:], user, chat_id)
     # /start r123 - пришёл по ссылке приглашения
     ref = None
     if cmd == '/start' and len(parts) > 1 and parts[1].startswith('r') and parts[1][1:].isdigit():
@@ -1108,7 +1189,8 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 print('update error:', e)
             return
-        routes = {'/activate': api_activate, '/trial': api_trial, '/check': api_check}
+        routes = {'/activate': api_activate, '/trial': api_trial, '/check': api_check, '/notify': api_notify,
+                  '/notify_link': api_notify_link, '/notify_status': api_notify_status, '/notify_unlink': api_notify_unlink}
         fn = routes.get(self.path)
         if not fn:
             return self.send_json(404, {'status': 'error'})
