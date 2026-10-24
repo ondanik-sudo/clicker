@@ -11,6 +11,7 @@
 #   PAY_NAME        получатель, как он виден при переводе (например «Данил С.»)
 #   PAY_BANK        банк карты (необязательно)
 #   SUPPORT_USERNAME  ник для кнопки «Поддержка», без @ (по умолчанию danilsugar)
+#   DEV_HWIDS       HWID компьютеров с функциями разработчика (охотник за купонами), через запятую. HWID - в /info ключа
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 import base64
 import hashlib
@@ -40,6 +41,7 @@ PAY_CARD = os.environ.get('PAY_CARD', '').strip()
 PAY_NAME = os.environ.get('PAY_NAME', '').strip()
 PAY_BANK = os.environ.get('PAY_BANK', '').strip()
 SUPPORT_USERNAME = os.environ.get('SUPPORT_USERNAME', 'danilsugar').strip().lstrip('@')
+DEV_HWIDS = {x.strip().upper() for x in os.environ.get('DEV_HWIDS', '').split(',') if x.strip()}
 
 # цены в рублях для продажи через бота
 PRICES = {'day': 50, '3days': 100, 'week': 300, 'month': 550}
@@ -214,6 +216,8 @@ def license_payload(hwid, now, dev):
     exp = 0 if (dev is None or dev['banned']) else dev['expires_at']
     data = {'v': 1, 'hwid': hwid, 'exp': exp, 'plan': (dev or {}).get('plan') or '', 'now': now,
             'trial_used': bool(dev and dev['trial_at'])}
+    if hwid.upper() in DEV_HWIDS and exp:
+        data['dev'] = True   # флаг внутри подписи: подделать его в license.json нельзя
     raw = json.dumps(data, ensure_ascii=False, sort_keys=True, separators=(',', ':')).encode('utf-8')
     return {'license': base64.b64encode(raw).decode(), 'sig': base64.b64encode(ed25519.sign(SIGN_SECRET, raw)).decode(),
             'exp': exp, 'plan': data['plan'], 'now': now}
